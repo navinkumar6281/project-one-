@@ -1,0 +1,99 @@
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import gradio as gr
+from surprise import SVD, Dataset, Reader
+from surprise.model_selection import train_test_split
+from functools import lru_cache
+
+
+#  Load Book Metadata
+meta_url = "https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/books.csv"
+books_df = pd.read_csv(meta_url)
+
+#  keep relevant columns
+books_df = books_df[['book_id', 'title', 'authors', 'original_publication_year', 'average_rating']]
+
+#  pseudo text field for TF-IDF
+books_df['text'] = (
+    books_df['title'].fillna('') + ' ' +
+    books_df['authors'].fillna('') + ' ' +
+    books_df['original_publication_year'].astype(str)
+)
+
+print(f"Loaded {len(books_df)} books ")
+
+
+#  Build TF-IDF Matrix
+vectorizer = TfidfVectorizer(stop_words='english', max_features=5000)
+tfidf_matrix = vectorizer.fit_transform(books_df['text'])
+print("TF-IDF matrix shape:", tfidf_matrix.shape)
+
+
+#  Load Ratings Data
+ratings_url = "https://raw.githubusercontent.com/zygmuntz/goodbooks-10k/master/ratings.csv"
+ratings_df = pd.read_csv(ratings_url)
+print(f"Loaded {len(ratings_df)} ratings ")
+
+
+#  Train SVD
+reader = Reader(rating_scale=(1, 5))
+data = Dataset.load_from_df(ratings_df[['user_id', 'book_id', 'rating']], reader)
+trainset, testset = train_test_split(data, test_size=0.2, random_state=42)
+
+svd = SVD(n_factors=50, random_state=42)
+svd.fit(trainset)
+print("SVD model trained ")
+
+#  Hybrid Recommender Function
+@lru_cache(maxsize=None)
+def hybrid_recommend(user_id, title, top_n=5):
+    idx = books_df[books_df['title'].str.lower() == title.lower()].index
+    if len(idx) == 0:
+        return "Book not found. Try another title."
+
+    idx = idx[0]
+    sim_scores = cosine_similarity(tfidf_matrix[idx], tfidf_matrix).flatten()
+    similar_books = np.argsort(sim_scores)[::-1][1:top_n+20]  
+
+    recs = []
+    for i in similar_books:
+        book_id = books_df.iloc[i]['book_id']
+        pred_rating = svd.predict(user_id, book_id).est
+        recs.append((books_df.iloc[i]['title'],
+                     books_df.iloc[i]['authors'],
+                     books_df.iloc[i]['average_rating'],
+                     pred_rating,
+                     sim_scores[i]))
+
+    recs_df = pd.DataFrame(recs, columns=['title', 'authors', 'avg_rating', 'pred_rating', 'similarity'])
+    recs_df = recs_df.sort_values(['pred_rating', 'similarity'], ascending=False).head(top_n)
+    return recs_df
+
+
+def recommend_interface(user_id, book_title):
+    results = hybrid_recommend(user_id, book_title)
+    if isinstance(results, str):
+        return results
+
+    display = []
+    for _, row in results.iterrows():
+        display.append(
+            f" *{row['title']}* by {row['authors']}\n Avg Rating: {row['avg_rating']:.2f} |  Predicted: {row['pred_rating']:.2f}"
+        )
+    return "\n\n".join(display)
+
+iface = gr.Interface(
+    fn=recommend_interface,
+    inputs=[
+        gr.Number(label="Enter User ID", value=1),
+        gr.Textbox(label="Enter Book Title (exact match)", placeholder="e.g. The Hobbit")
+    ],
+    outputs="markdown",
+    title=" Hybrid Book Recommender system",
+    description="Enter a User ID and a Book Title to get hybrid (content + collaborative) recommendations."
+)
+
+iface.launch(debug=True)
+app.py
